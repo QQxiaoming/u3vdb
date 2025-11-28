@@ -39,6 +39,26 @@ namespace {
 
 #define TY_UVCP_MAX_MSG_LEN 65536
 
+// USB3 Vision 类专用设备信息描述符
+#pragma pack(push, 1)
+struct usb3v_device_info_descriptor {
+	uint8_t  bLength;
+	uint8_t  bDescriptorType;
+	uint8_t  bDescriptorSubType;
+	uint32_t bGenCPVersion;   // 总线上以小端传输
+	uint32_t bU3VVersion;     // 总线上以小端传输
+	uint8_t  iDeviceGUID;
+	uint8_t  iVendorName;
+	uint8_t  iModelName;
+	uint8_t  iFamilyName;
+	uint8_t  iDeviceVersion;
+	uint8_t  iManufacturerInf;
+	uint8_t  iSerialNumber;
+	uint8_t  iUserDefinedName;
+	uint8_t  bmSpeedSupport;
+};
+#pragma pack(pop)
+
 //UVCP (USB3 Vision Control Protocol)
 namespace UVCPConstants {
     const uint32_t MAGIC = 0x43563355; // "U3VC"
@@ -318,11 +338,85 @@ class U3VDevice {
 			return false;
 		}
 
-		std::cout << "Opened USB3 Vision device " << std::hex << vendorId << ':' << productId;
-		if (!serialFilter.empty()) {
-			std::cout << " (serial=" << serialFilter << ')';
+		// Successfully opened; print detailed USB descriptor information.
+		libusb_device* dev = libusb_get_device(handle_);
+		libusb_device_descriptor desc{};
+		if (dev && libusb_get_device_descriptor(dev, &desc) == LIBUSB_SUCCESS) {
+			auto printStringByIndex = [&](uint8_t index, const char* label) {
+				if (!index) return;
+				unsigned char strBuf[256] = {0};
+				int len = libusb_get_string_descriptor_ascii(handle_, index, strBuf, sizeof(strBuf));
+				if (len > 0) {
+					std::cout << "  " << std::setw(20) << std::left << label << ": "
+						  << reinterpret_cast<const char*>(strBuf) << '\n';
+				}
+			};
+
+			std::cout << "Opened USB3 Vision device " << std::hex
+				  << std::setw(4) << std::setfill('0') << desc.idVendor << ':'
+				  << std::setw(4) << std::setfill('0') << desc.idProduct
+				  << std::dec << std::setfill(' ') << std::endl;
+			unsigned char strBuf[256] = {0};
+			if (desc.iManufacturer &&
+				libusb_get_string_descriptor_ascii(handle_, desc.iManufacturer, strBuf, sizeof(strBuf)) > 0) {
+				std::cout << "  Manufacturer        : " << strBuf << '\n';
+			}
+			if (desc.iProduct &&
+				libusb_get_string_descriptor_ascii(handle_, desc.iProduct, strBuf, sizeof(strBuf)) > 0) {
+				std::cout << "  Product             : " << strBuf << '\n';
+			}
+			if (desc.iSerialNumber &&
+				libusb_get_string_descriptor_ascii(handle_, desc.iSerialNumber, strBuf, sizeof(strBuf)) > 0) {
+				std::cout << "  SerialNumber        : " << strBuf << '\n';
+			}
+
+			// Parse configuration to locate USB3 Vision Interface Info Descriptor (0x14,0x24,...)
+				if (dev) {
+				libusb_config_descriptor* cfg = nullptr;
+				if (libusb_get_active_config_descriptor(dev, &cfg) == LIBUSB_SUCCESS && cfg) {
+					for (int ifidx = 0; ifidx < cfg->bNumInterfaces; ++ifidx) {
+						const libusb_interface& intf = cfg->interface[ifidx];
+						for (int alt = 0; alt < intf.num_altsetting; ++alt) {
+							const libusb_interface_descriptor& idesc = intf.altsetting[alt];
+							const uint8_t* ptr = idesc.extra;
+							int remain = idesc.extra_length;
+							while (ptr && remain >= 2) {
+								uint8_t len  = ptr[0];
+								uint8_t type = ptr[1];
+								if (len < 2 || len > remain) break;
+								// USB3 Vision Device Info Descriptor (class-specific 0x24)
+								if (type == 0x24 && len == sizeof(usb3v_device_info_descriptor)) {
+									const auto* info = reinterpret_cast<const usb3v_device_info_descriptor*>(ptr);
+									uint32_t genCPVer = info->bGenCPVersion;
+									uint32_t u3vVer   = info->bU3VVersion;
+									std::cout << "  GenCP version       : 0x" << std::hex << genCPVer << std::dec << '\n';
+									std::cout << "  U3V version         : 0x" << std::hex << u3vVer << std::dec << '\n';
+									printStringByIndex(info->iDeviceGUID,      "U3V Device GUID");
+									printStringByIndex(info->iVendorName,      "U3V Vendor Name");
+									printStringByIndex(info->iModelName,       "U3V Model Name");
+									printStringByIndex(info->iFamilyName,      "U3V Family Name");
+									printStringByIndex(info->iDeviceVersion,   "U3V Device Version");
+									printStringByIndex(info->iManufacturerInf, "U3V ManufacturerInfo");
+									printStringByIndex(info->iSerialNumber,    "U3V SerialNumber");
+									printStringByIndex(info->iUserDefinedName, "U3V UserDefinedName");
+									std::cout << "  " << std::setw(20) << std::left << "U3V SpeedSupport" << ": 0x"
+										  << std::hex << static_cast<int>(info->bmSpeedSupport) << std::dec << '\n';
+								}
+								ptr    += len;
+								remain -= len;
+							}
+						}
+					}
+					libusb_free_config_descriptor(cfg);
+				}
+			}
+		} else {
+			std::cout << "Opened USB3 Vision device " << std::hex << vendorId << ':' << productId;
+			if (!serialFilter.empty()) {
+				std::cout << " (serial=" << serialFilter << ')';
+			}
+			std::cout << std::dec << std::endl;
 		}
-		std::cout << std::dec << std::endl;
 		return true;
 	}
 
