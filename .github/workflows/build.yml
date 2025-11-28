@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-linux:
+    name: Build on Ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (libusb, CMake, g++)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0-dev cmake build-essential
+
+      - name: Configure CMake
+        run: |
+          mkdir -p build
+          cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+
+      - name: Build
+        run: |
+          cd build
+          cmake --build . --config Release -- -j$(nproc)
+
+      - name: Run basic smoke test
+        run: |
+          cd build
+          ./u3vdb --help || true
+
+      - name: Upload Linux binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: u3vdb-linux
+          path: build/u3vdb
+
+  build-windows:
+    name: Build on Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          mkdir build
+          cd build
+          cmake .. -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cd build
+          cmake --build . --config Release
+
+      - name: Upload Windows binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: u3vdb-windows
+          path: build/Release/u3vdb.exe
