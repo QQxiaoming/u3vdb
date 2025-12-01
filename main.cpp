@@ -39,14 +39,14 @@ namespace {
 
 #define TY_UVCP_MAX_MSG_LEN 65536
 
-// USB3 Vision 类专用设备信息描述符
+// USB3 Vision Class
 #pragma pack(push, 1)
 struct usb3v_device_info_descriptor {
 	uint8_t  bLength;
 	uint8_t  bDescriptorType;
 	uint8_t  bDescriptorSubType;
-	uint32_t bGenCPVersion;   // 总线上以小端传输
-	uint32_t bU3VVersion;     // 总线上以小端传输
+	uint32_t bGenCPVersion;
+	uint32_t bU3VVersion;
 	uint8_t  iDeviceGUID;
 	uint8_t  iVendorName;
 	uint8_t  iModelName;
@@ -107,13 +107,13 @@ struct UVCPReadMemoryCmd {  //ArvUvcpReadMemoryCmd
 
 struct UVCPReadMemoryAck {      //ArvUvcpReadMemoryCmd
     UVCPHeader header{};
-    uint8_t data[1]; // 可变长度数据
+    uint8_t data[1];
 };
 
 struct UVCPWriteMemoryCmd {      //ArvUvcpWriteMemoryCmd
     UVCPHeader header{};
     uint64_t address = 0;
-    uint8_t data[1]; // 可变长度数据
+    uint8_t data[1];
 };
 
 struct UVCPWriteMemoryAck {     //ArvUvcpWriteMemoryAck
@@ -163,6 +163,7 @@ constexpr uint32_t kStatusChildAlive = 1u << 1;
 constexpr uint32_t kStatusOutputPending = 1u << 2;
 constexpr uint32_t kStatusOverflow = 1u << 3;
 constexpr uint32_t kStatusError = 1u << 4;
+constexpr uint32_t kStatusEchoEnabled = 1u << 5;
 
 constexpr uint32_t kCtrlStart = 1u << 0;
 constexpr uint32_t kCtrlReset = 1u << 1;
@@ -822,6 +823,9 @@ class U3VDevice {
 		if (!initialize()) {
 			return false;
 		}
+		if (!ensureAuth()) {
+			return false;
+		}
 		// do not clear auth
 		uint32_t ctrl = kCtrlReset | kCtrlClearFlags;
 		if (echoEnabled_) {
@@ -1224,6 +1228,20 @@ class U3VDevice {
 		return performFileUpload(tokens[1], tokens[2]);
 	}
 	void setEchoEnabled(bool enable) { echoEnabled_ = enable; }
+	bool getEchoEnabled() {
+		uint32_t status = 0;
+		// If we cannot read the terminal status register, treat as error.
+		if (!const_cast<TerminalClient*>(this)->readRegister(kTerminalStatusAddr, status)) {
+			std::cerr << "Failed to read terminal status register for echo state" << std::endl;
+			return echoEnabled_;
+		}
+		if ((status & kStatusEchoEnabled) != 0) {
+			echoEnabled_ = true;
+		} else {
+			echoEnabled_ = false;
+		}
+		return echoEnabled_;
+	}
 
   private:
 	struct StdinState {
@@ -1755,10 +1773,17 @@ int main(int argc, char** argv) {
 			  << ", falling back to V1 mode" << std::dec << std::endl;
 		interactiveMode = 1;
 	}
+	bool currentEcho = terminal.getEchoEnabled();
 	if (interactive) {
 		terminal.setEchoEnabled(interactiveMode == 2);
+		if (currentEcho != (interactiveMode == 2)) {
+			resetSession = true;
+		}
 	} else {
 		terminal.setEchoEnabled(false);
+		if (currentEcho != false) {
+			resetSession = true;
+		}
 	}
 
 	if (resetSession && !terminal.reset()) {
