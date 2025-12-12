@@ -19,6 +19,8 @@
 #include <vector>
 #include <functional>
 
+#include <filesystem>
+
 #ifdef _WIN32
 	#include <windows.h>
 	#include <conio.h>
@@ -744,6 +746,63 @@ class U3VDevice {
 	uint16_t requestId_ = 0;
 	};
 
+	bool hasWildcard(const std::string& s) {
+		return s.find_first_of("*?[") != std::string::npos;
+	}
+
+	bool wildcardMatch(const char* pattern, const char* str) {
+		const char* p = pattern;
+		const char* s = str;
+		const char* star = nullptr;
+		const char* starMatch = nullptr;
+		while (*s) {
+			if (*p == '?' || *p == *s) {
+				++p;
+				++s;
+				continue;
+			}
+			if (*p == '*') {
+				star = p++;
+				starMatch = s;
+				continue;
+			}
+			if (star) {
+				p = star + 1;
+				s = ++starMatch;
+				continue;
+			}
+			return false;
+		}
+		while (*p == '*') {
+			++p;
+		}
+		return *p == '\0';
+	}
+
+	std::vector<std::string> expandLocalPattern(const std::string& pattern) {
+		std::vector<std::string> results;
+		if (!hasWildcard(pattern)) {
+			results.push_back(pattern);
+			return results;
+		}
+		namespace fs = std::filesystem;
+		fs::path p(pattern);
+		fs::path dir = p.has_parent_path() ? p.parent_path() : fs::path(".");
+		std::string namePattern = p.filename().string();
+		std::error_code ec;
+		fs::directory_iterator it(dir, ec);
+		if (ec) {
+			return results;
+		}
+		for (const auto& entry : it) {
+			std::string filename = entry.path().filename().string();
+			if (wildcardMatch(namePattern.c_str(), filename.c_str())) {
+				results.push_back(entry.path().string());
+			}
+		}
+		return results;
+	}
+
 	std::vector<std::string> splitTokens(const std::string& line);
 
 	class TerminalClient {
@@ -974,7 +1033,7 @@ class U3VDevice {
 		if (!ensureSession()) {
 			return false;
 		}
-		std::cout << "Interactive shell ready (firmware version 0x" << std::hex << version_
+		std::cout << "Interactive shell ready (kTerminal version 0x" << std::hex << version_
 				  << std::dec << "). Type 'exit' to quit." << std::endl;
 
 		std::string warmup;
@@ -1038,7 +1097,7 @@ class U3VDevice {
 		if (!ensureSession()) {
 			return false;
 		}
-		std::cout << "Interactive shell ready (firmware version 0x" << std::hex << version_
+		std::cout << "Interactive shell ready (kTerminal version 0x" << std::hex << version_
 				  << std::dec << "). Type 'exit' to quit." << std::endl;
 
 		// Drain any warmup output.
@@ -1111,6 +1170,49 @@ class U3VDevice {
 				toSend.reserve(static_cast<size_t>(n));
 				for (ssize_t i = 0; i < n; ++i) {
 					unsigned char ch = static_cast<unsigned char>(inBuf[static_cast<size_t>(i)]);
+
+#ifdef _WIN32
+					// On Windows, arrow keys and some others are reported by _getch()
+					// as a leading 0 or 0xE0 byte followed by a scan code. Translate the
+					// most common ones into ANSI escape sequences so the remote shell
+					// sees the same bytes as on a POSIX terminal.
+					if ((ch == 0x00 || ch == 0xE0) && i + 1 < n) {
+						unsigned char scan = static_cast<unsigned char>(inBuf[static_cast<size_t>(i + 1)]);
+						bool handledSpecial = true;
+						// Arrow keys
+						switch (scan) {
+							case 72: // Up
+								toSend.push_back(0x1b);
+								toSend.push_back('[');
+								toSend.push_back('A');
+								break;
+							case 80: // Down
+								toSend.push_back(0x1b);
+								toSend.push_back('[');
+								toSend.push_back('B');
+								break;
+							case 75: // Left
+								toSend.push_back(0x1b);
+								toSend.push_back('[');
+								toSend.push_back('D');
+								break;
+							case 77: // Right
+								toSend.push_back(0x1b);
+								toSend.push_back('[');
+								toSend.push_back('C');
+								break;
+							default:
+								// Unhandled special key: ignore.
+								handledSpecial = false;
+								break;
+						}
+						if (handledSpecial) {
+							// Skip the scan-code byte; we already consumed it.
+							++i;
+							continue;
+						}
+					}
+#endif
 					if (ch == static_cast<unsigned char>(kExitKey)) {
 						exitRequested = true;
 						continue;
@@ -1203,6 +1305,34 @@ class U3VDevice {
 		return true;
 	}
 
+	bool expandRemotePattern(const std::string& pattern, std::vector<std::string>& outPaths) {
+		outPaths.clear();
+		// Use remote shell to expand wildcard: ls -1 -d pattern
+		std::string cmd = "ls -1 -d " + pattern + " 2>/dev/null";
+		if (!sendCommand(cmd)) {
+			std::cerr << "Failed to send remote pattern expansion command" << std::endl;
+			return false;
+		}
+		std::string output;
+		if (!drainOutput(output, std::chrono::milliseconds(200), std::chrono::seconds(3))) {
+			std::cerr << "Failed to read remote pattern expansion output" << std::endl;
+			return false;
+		}
+		std::istringstream iss(output);
+		std::string line;
+		while (std::getline(iss, line)) {
+			// Trim whitespace
+			size_t start = line.find_first_not_of(" \t\r\n");
+			if (start == std::string::npos) continue;
+			size_t end = line.find_last_not_of(" \t\r\n");
+			std::string candidate = line.substr(start, end - start + 1);
+			if (wildcardMatch(pattern.c_str(), candidate.c_str())) {
+				outPaths.push_back(candidate);
+			}
+		}
+		return true;
+	}
+
 	bool handleFileTransferCommand(const std::string& line, bool& handled) {
 		handled = false;
 		auto tokens = splitTokens(line);
@@ -1219,13 +1349,74 @@ class U3VDevice {
 				std::cerr << "Usage: u3vget <remote-path> <local-path>" << std::endl;
 				return true;
 			}
-			return performFileDownload(tokens[1], tokens[2]);
+			const std::string& remoteSpec = tokens[1];
+			const std::string& localSpec = tokens[2];
+			if (!hasWildcard(remoteSpec)) {
+				return performFileDownload(remoteSpec, localSpec);
+			}
+			// Remote wildcard: download multiple remote files into local directory
+			namespace fs = std::filesystem;
+			fs::path localDir(localSpec);
+			if (!localSpec.empty() && localSpec.back() == '/') {
+				// Treat as directory path
+			} else if (fs::exists(localDir) && fs::is_directory(localDir)) {
+				// Existing directory
+			} else {
+				// Ensure directory exists when using wildcard remote path
+				std::error_code ec;
+				if (!fs::create_directories(localDir, ec) && ec) {
+					std::cerr << "u3vget: local path must be a directory when remote path contains wildcards" << std::endl;
+					return true;
+				}
+			}
+			std::vector<std::string> remotePaths;
+			if (!expandRemotePattern(remoteSpec, remotePaths)) {
+				return false;
+			}
+			if (remotePaths.empty()) {
+				std::cerr << "u3vget: no remote files match pattern '" << remoteSpec << "'" << std::endl;
+				return true;
+			}
+			bool allOk = true;
+			for (const auto& rp : remotePaths) {
+				fs::path lp = localDir / fs::path(rp).filename();
+				if (!performFileDownload(rp, lp.string())) {
+					allOk = false;
+				}
+			}
+			return allOk;
 		}
+		// u3vput
 		if (tokens.size() != 3) {
 			std::cerr << "Usage: u3vput <local-path> <remote-path>" << std::endl;
 			return true;
 		}
-		return performFileUpload(tokens[1], tokens[2]);
+		const std::string& localSpec = tokens[1];
+		const std::string& remoteDest = tokens[2];
+		std::vector<std::string> sources = expandLocalPattern(localSpec);
+		if (sources.empty()) {
+			std::cerr << "u3vput: no local files match '" << localSpec << "'" << std::endl;
+			return true;
+		}
+		if (sources.size() > 1) {
+			if (remoteDest.empty() || remoteDest.back() != '/') {
+				std::cerr << "u3vput: multiple source files matched; remote path must end with '/'" << std::endl;
+				return true;
+			}
+		}
+		bool allOk = true;
+		namespace fs = std::filesystem;
+		for (const auto& src : sources) {
+			std::string remotePath = remoteDest;
+			if (sources.size() > 1 || (!remoteDest.empty() && remoteDest.back() == '/')) {
+				fs::path sp(src);
+				remotePath = remoteDest + sp.filename().string();
+			}
+			if (!performFileUpload(src, remotePath)) {
+				allOk = false;
+			}
+		}
+		return allOk;
 	}
 	void setEchoEnabled(bool enable) { echoEnabled_ = enable; }
 	bool getEchoEnabled() {
