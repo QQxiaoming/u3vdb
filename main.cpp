@@ -132,7 +132,7 @@ struct UVCPPendingAck {
 #pragma pack(pop)
 
 constexpr uint16_t kVendorId = 0x04b4;
-constexpr uint16_t kProductId = 0x1003;
+constexpr uint16_t kProductId = 0x1004;
 // Control interface and endpoints are discovered dynamically.
 constexpr unsigned int kTransferTimeoutMs = 10000;
 
@@ -1823,7 +1823,7 @@ void printUsage(const char* exe) {
 		  	  << "  -id, --id <serial>               Match device by USB serial number (iSerial)\n"
 		      << "                                   (omit to be prompted when multiple devices exist)\n"
 			  << "       --vid <id>                  USB vendor ID (e.g., 0x04b4)\n"
-			  << "       --pid <id>                  USB product ID (e.g., 0x1003)\n"
+			  << "       --pid <id>                  USB product ID (e.g., 0x1004)\n"
 			  << "  -h,  --help                      Show this message\n";
 }
 

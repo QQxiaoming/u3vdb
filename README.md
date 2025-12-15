@@ -37,7 +37,7 @@ Options:
   -r, --reset           Reset terminal session before use
   -p, --password <pwd>  Password for unlocking terminal (or use TY_TERM_PASS)
       --vid <id>        USB vendor ID (e.g., 0x04b4)
-      --pid <id>        USB product ID (e.g., 0x1003)
+      --pid <id>        USB product ID (e.g., 0x1004)
   -h, --help            Show this message
 ```
 
@@ -52,5 +52,5 @@ Examples:
   ```
 - Specify VID/PID explicitly (hex or decimal):
   ```sh
-  ./u3vdb --vid 0x04b4 --pid 0x1003 -p U3V
+  ./u3vdb --vid 0x04b4 --pid 0x1004 -p U3V
   ```
