@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -25,6 +26,15 @@
 	#include <windows.h>
 	#include <conio.h>
 	#include <io.h>
+	#ifndef ENABLE_QUICK_EDIT_MODE
+		#define ENABLE_QUICK_EDIT_MODE 0x0040
+	#endif
+	#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+		#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+	#endif
+	#ifndef ENABLE_VIRTUAL_TERMINAL_INPUT
+		#define ENABLE_VIRTUAL_TERMINAL_INPUT 0x0200
+	#endif
 	#ifndef STDIN_FILENO
 		#define STDIN_FILENO 0
 	#endif
@@ -1157,6 +1167,10 @@ class U3VDevice {
 				while (_kbhit() && idx < static_cast<int>(inBuf.size())) {
 					int ch = _getch();
 					inBuf[static_cast<size_t>(idx++)] = static_cast<char>(ch);
+					if ((ch == 0 || ch == 0xE0) && idx < static_cast<int>(inBuf.size())) {
+						// Keep extended-key prefix and scan code in the same batch.
+						inBuf[static_cast<size_t>(idx++)] = static_cast<char>(_getch());
+					}
 				}
 				n = idx;
 			} else {
@@ -1176,41 +1190,18 @@ class U3VDevice {
 					// as a leading 0 or 0xE0 byte followed by a scan code. Translate the
 					// most common ones into ANSI escape sequences so the remote shell
 					// sees the same bytes as on a POSIX terminal.
-					if ((ch == 0x00 || ch == 0xE0) && i + 1 < n) {
-						unsigned char scan = static_cast<unsigned char>(inBuf[static_cast<size_t>(i + 1)]);
-						bool handledSpecial = true;
-						// Arrow keys
-						switch (scan) {
-							case 72: // Up
-								toSend.push_back(0x1b);
-								toSend.push_back('[');
-								toSend.push_back('A');
-								break;
-							case 80: // Down
-								toSend.push_back(0x1b);
-								toSend.push_back('[');
-								toSend.push_back('B');
-								break;
-							case 75: // Left
-								toSend.push_back(0x1b);
-								toSend.push_back('[');
-								toSend.push_back('D');
-								break;
-							case 77: // Right
-								toSend.push_back(0x1b);
-								toSend.push_back('[');
-								toSend.push_back('C');
-								break;
-							default:
-								// Unhandled special key: ignore.
-								handledSpecial = false;
-								break;
+					if (ch == 0x00 || ch == 0xE0) {
+						if (i + 1 >= n) {
+							continue;
 						}
-						if (handledSpecial) {
-							// Skip the scan-code byte; we already consumed it.
+						unsigned char scan = static_cast<unsigned char>(inBuf[static_cast<size_t>(i + 1)]);
+						if (appendWindowsSpecialKeySequence(scan, toSend)) {
 							++i;
 							continue;
 						}
+						// Skip unknown extended key pairs instead of sending raw bytes.
+						++i;
+						continue;
 					}
 #endif
 					if (ch == static_cast<unsigned char>(kExitKey)) {
@@ -1435,10 +1426,54 @@ class U3VDevice {
 	}
 
   private:
+	static bool appendAnsiSequence(std::vector<uint8_t>& out, const char* seq) {
+		if (!seq) {
+			return false;
+		}
+		out.push_back(0x1b);
+		for (const char* p = seq; *p != '\0'; ++p) {
+			out.push_back(static_cast<uint8_t>(*p));
+		}
+		return true;
+	}
+
+#ifdef _WIN32
+	static bool appendWindowsSpecialKeySequence(unsigned char scanCode, std::vector<uint8_t>& out) {
+		switch (scanCode) {
+			case 72: // Up
+				return appendAnsiSequence(out, "[A");
+			case 80: // Down
+				return appendAnsiSequence(out, "[B");
+			case 75: // Left
+				return appendAnsiSequence(out, "[D");
+			case 77: // Right
+				return appendAnsiSequence(out, "[C");
+			case 71: // Home
+				return appendAnsiSequence(out, "[H");
+			case 79: // End
+				return appendAnsiSequence(out, "[F");
+			case 73: // Page Up
+				return appendAnsiSequence(out, "[5~");
+			case 81: // Page Down
+				return appendAnsiSequence(out, "[6~");
+			case 82: // Insert
+				return appendAnsiSequence(out, "[2~");
+			case 83: // Delete
+				return appendAnsiSequence(out, "[3~");
+			case 15: // Shift+Tab
+				return appendAnsiSequence(out, "[Z");
+			default:
+				return false;
+		}
+	}
+#endif
+
 	struct StdinState {
 #ifdef _WIN32
-		DWORD origMode = 0;
-		bool hasMode = false;
+		DWORD origInMode = 0;
+		DWORD origOutMode = 0;
+		bool hasInMode = false;
+		bool hasOutMode = false;
 #else
 		termios orig{};
 #endif
@@ -1450,17 +1485,40 @@ class U3VDevice {
 		if (hIn == INVALID_HANDLE_VALUE || hIn == nullptr) {
 			return false;
 		}
-		DWORD mode = 0;
-		if (!GetConsoleMode(hIn, &mode)) {
+		DWORD inMode = 0;
+		if (!GetConsoleMode(hIn, &inMode)) {
 			return false;
 		}
-		state.origMode = mode;
-		state.hasMode = true;
-		mode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
-		mode |= ENABLE_EXTENDED_FLAGS;
-		if (!SetConsoleMode(hIn, mode)) {
-			return false;
+		state.origInMode = inMode;
+		state.hasInMode = true;
+
+		DWORD rawInMode = inMode;
+		rawInMode &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+		rawInMode |= ENABLE_EXTENDED_FLAGS;
+		rawInMode &= ~ENABLE_QUICK_EDIT_MODE;
+		rawInMode |= ENABLE_VIRTUAL_TERMINAL_INPUT;
+		if (!SetConsoleMode(hIn, rawInMode)) {
+			// Fallback for older consoles that do not support VT input.
+			rawInMode &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
+			if (!SetConsoleMode(hIn, rawInMode)) {
+				return false;
+			}
 		}
+
+		HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+		if (hOut != INVALID_HANDLE_VALUE && hOut != nullptr) {
+			DWORD outMode = 0;
+			if (GetConsoleMode(hOut, &outMode)) {
+				state.origOutMode = outMode;
+				state.hasOutMode = true;
+				DWORD rawOutMode = outMode;
+				rawOutMode |= ENABLE_PROCESSED_OUTPUT;
+				rawOutMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+				// Best effort: some hosts already behave correctly without this flag.
+				SetConsoleMode(hOut, rawOutMode);
+			}
+		}
+
 		return true;
 #else
 		if (tcgetattr(STDIN_FILENO, &state.orig) != 0) {
@@ -1482,14 +1540,18 @@ class U3VDevice {
 
 	static void restoreStdin(const StdinState& state) {
 #ifdef _WIN32
-		if (!state.hasMode) {
-			return;
+		if (state.hasInMode) {
+			HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+			if (hIn != INVALID_HANDLE_VALUE && hIn != nullptr) {
+				SetConsoleMode(hIn, state.origInMode);
+			}
 		}
-		HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
-		if (hIn == INVALID_HANDLE_VALUE || hIn == nullptr) {
-			return;
+		if (state.hasOutMode) {
+			HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+			if (hOut != INVALID_HANDLE_VALUE && hOut != nullptr) {
+				SetConsoleMode(hOut, state.origOutMode);
+			}
 		}
-		SetConsoleMode(hIn, state.origMode);
 #else
 		if (tcsetattr(STDIN_FILENO, TCSANOW, &state.orig) != 0) {
 			std::perror("tcsetattr");
